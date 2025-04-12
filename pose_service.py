@@ -1,8 +1,13 @@
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse
+from fastapi.responses import StreamingResponse
+from io import BytesIO
 import cv2
 import mediapipe as mp
 import numpy as np
+import base64
+import datetime
+import os
 
 app = FastAPI()
 mp_pose = mp.solutions.pose
@@ -23,17 +28,38 @@ async def estimate_height(image: UploadFile = File(...)):
 
         landmarks = results.pose_landmarks.landmark
 
-        # Get head (nose) and lowest heel
-        head_y = landmarks[mp_pose.PoseLandmark.NOSE].y * img.shape[0]
-        heel_y = min(
-            landmarks[mp_pose.PoseLandmark.LEFT_HEEL].y,
-            landmarks[mp_pose.PoseLandmark.RIGHT_HEEL].y
-        ) * img.shape[0]
-
-        pixel_height = abs(heel_y - head_y)
-
-    # Detect the reference marker (e.g., A4 paper)
+        # Detect the reference marker (e.g., A4 paper)
     marker_height_px = detect_marker_height(img)
+
+        # 1. Extract landmarks related to upper face
+    head_candidates = [
+        landmarks[mp_pose.PoseLandmark.NOSE].y,
+        landmarks[mp_pose.PoseLandmark.LEFT_EYE].y,
+        landmarks[mp_pose.PoseLandmark.RIGHT_EYE].y,
+        landmarks[mp_pose.PoseLandmark.LEFT_EAR].y,
+        landmarks[mp_pose.PoseLandmark.RIGHT_EAR].y
+    ]
+    # 2. Find top-most facial point in Y-pixels
+    raw_head_y = min(head_candidates) * img.shape[0]
+
+    # 3. Compute cm-per-pixel scale using A4 height
+    cm_per_pixel = 29.7 / marker_height_px  # A4 marker assumed
+
+    # 4. Estimate real-world eye-to-hair distance (12 cm) → pixel offset
+    eye_to_hair_cm = 12.0
+    offset_px = eye_to_hair_cm / cm_per_pixel
+
+    # 5. Adjust head_y upward to crown
+    head_y = raw_head_y - offset_px
+
+    heel_y = max(
+        landmarks[mp_pose.PoseLandmark.LEFT_HEEL].y,
+        landmarks[mp_pose.PoseLandmark.RIGHT_HEEL].y
+    ) * img.shape[0] - 10  # ← reduce overreach from shoes/floor
+
+    pixel_height = abs(heel_y - head_y)
+
+
     if not marker_height_px:
         return JSONResponse(
             content={"error": "Reference marker not found."},
@@ -44,12 +70,47 @@ async def estimate_height(image: UploadFile = File(...)):
     cm_per_pixel = 29.7 / marker_height_px
     person_height_cm = pixel_height * cm_per_pixel
 
+    # 🔵 Draw pose landmarks
+    for landmark in landmarks:
+     x = int(landmark.x * img.shape[1])
+     y = int(landmark.y * img.shape[0])
+     cv2.circle(img, (x, y), 5, (0, 255, 0), -1)
+
+     # 🔹 Draw head & heel lines
+    cv2.line(img, (0, int(head_y)), (img.shape[1], int(head_y)), (255, 0, 0), 2)
+    cv2.line(img, (0, int(heel_y)), (img.shape[1], int(heel_y)), (0, 0, 255), 2)
+
+# 🔵 Draw height info
+    cv2.putText(img, f"Height: {round(person_height_cm, 2)} cm", (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+# 🔹 Save to F:\annotatedImage
+    filename = datetime.datetime.now().strftime("height_%Y%m%d_%H%M%S.jpg")
+    save_path = os.path.join("F:\\annotatedImage", filename)
+    cv2.imwrite(save_path, img)
+
+    print(f"✅ Annotated image saved to: {save_path}")
+
+# 🔵 Encode image to JPEG for response
+    _, buffer = cv2.imencode('.jpg', img)
+    annotated_bytes = BytesIO(buffer.tobytes())
+
+    base64_image = base64.b64encode(buffer).decode("utf-8")
+
+    print("📏 --- HEIGHT DEBUG ---")
+    print(f"Head Y: {head_y}")
+    print(f"Heel Y: {heel_y}")
+    print(f"Pixel height (heel - head): {pixel_height}")
+    print(f"Marker height in pixels: {marker_height_px}")
+    print(f"cm_per_pixel = 29.7 / {marker_height_px} = {cm_per_pixel}")
+    print(f"Estimated height (cm): {person_height_cm}")
+    print("📏 --------------------")
+
+
     return {
-        "pixel_height": pixel_height,
-        "marker_height_px": marker_height_px,
-        "cm_per_pixel": cm_per_pixel,
         "estimated_height_cm": round(person_height_cm, 2)
-    }
+         }
+
 
 
 def detect_marker_height(img):
@@ -59,15 +120,25 @@ def detect_marker_height(img):
 
     contours, _ = cv2.findContours(edged.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
+    a4_ratio = 29.7 / 21.0  # A4 height / width ≈ 1.41
     marker_height_pixels = None
+    best_match_score = 0
 
     for cnt in contours:
         peri = cv2.arcLength(cnt, True)
         approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
 
-        if len(approx) == 4:  # likely a rectangle
+        if len(approx) == 4:
             (x, y, w, h) = cv2.boundingRect(approx)
-            marker_height_pixels = h
-            break  # take the first one found (optional: choose largest)
+            ratio = h / w if w != 0 else 0
+            area = w * h
+
+            # Give high score to large areas with aspect ratio close to A4
+            match_score = area / (1 + abs(ratio - a4_ratio))
+
+            if match_score > best_match_score:
+                best_match_score = match_score
+                marker_height_pixels = h
 
     return marker_height_pixels
+
